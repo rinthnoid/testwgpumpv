@@ -19,41 +19,73 @@ use bwgpu::{Bitmap, PixFmt, Plane, Renderer, ScaleFilter, VideoFrame, YuvMatrix,
 struct App {
     renderer: Option<Renderer>,
     window: Option<Arc<Window>>,
+    pattern: PatternBuf,
     start: std::time::Instant,
 }
 
 /// Animated 4:2:0 test pattern: moving luma gradient + hue-cycling chroma.
-fn test_pattern(t: f32, w: u32, h: u32) -> VideoFrame<'static> {
+/// Fills the caller-owned plane buffers in place; `set_video` copies the
+/// planes into GPU memory before returning, so the borrow ends right after.
+fn fill_pattern(buf: &mut PatternBuf, t: f32) {
+    let (w, h) = (buf.width, buf.height);
     let cw = w.div_ceil(2);
     let ch = h.div_ceil(2);
-    let mut y = vec![0u8; (w * h) as usize];
-    let mut u = vec![128u8; (cw * ch) as usize];
-    let mut v = vec![128u8; (cw * ch) as usize];
     for j in 0..h {
         for i in 0..w {
             let wave = ((i as f32 / w as f32 * 8.0 + t).sin() * 0.25 + 0.5) * 255.0;
             let grad = j as f32 / h as f32 * 0.4 * 255.0;
-            y[(j * w + i) as usize] = (wave * 0.7 + grad * 0.3) as u8;
+            buf.y[(j * w + i) as usize] = (wave * 0.7 + grad * 0.3) as u8;
         }
     }
     for j in 0..ch {
         for i in 0..cw {
-            u[(j * cw + i) as usize] = (((t * 0.7).sin() * 0.5 + 0.5) * 255.0) as u8;
-            v[(j * cw + i) as usize] = (((t * 0.7 + 2.0).sin() * 0.5 + 0.5) * 255.0) as u8;
+            buf.u[(j * cw + i) as usize] = (((t * 0.7).sin() * 0.5 + 0.5) * 255.0) as u8;
+            buf.v[(j * cw + i) as usize] = (((t * 0.7 + 2.0).sin() * 0.5 + 0.5) * 255.0) as u8;
         }
     }
-    let y: &'static [u8] = Box::leak(y.into_boxed_slice());
-    let u: &'static [u8] = Box::leak(u.into_boxed_slice());
-    let v: &'static [u8] = Box::leak(v.into_boxed_slice());
-    VideoFrame {
-        fmt: PixFmt::I420,
-        width: w,
-        height: h,
-        planes: [
-            Plane { data: y, stride: 0 },
-            Plane { data: u, stride: 0 },
-            Plane { data: v, stride: 0 },
-        ],
+}
+
+/// Reusable plane storage for the test pattern (no per-frame allocation).
+struct PatternBuf {
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+impl PatternBuf {
+    fn new(width: u32, height: u32) -> Self {
+        let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+        Self {
+            y: vec![0u8; (width * height) as usize],
+            u: vec![128u8; (cw * ch) as usize],
+            v: vec![128u8; (cw * ch) as usize],
+            width,
+            height,
+        }
+    }
+
+    fn frame(&self) -> VideoFrame<'_> {
+        VideoFrame {
+            fmt: PixFmt::I420,
+            width: self.width,
+            height: self.height,
+            planes: [
+                Plane {
+                    data: &self.y,
+                    stride: 0,
+                },
+                Plane {
+                    data: &self.u,
+                    stride: 0,
+                },
+                Plane {
+                    data: &self.v,
+                    stride: 0,
+                },
+            ],
+        }
     }
 }
 
@@ -109,19 +141,19 @@ impl ApplicationHandler for App {
                     return;
                 };
                 let t = self.start.elapsed().as_secs_f32();
-                let (w, h) = (256, 144);
                 r.set_scale(ScaleFilter::CatmullRom);
-                let frame = test_pattern(t, w, h);
+                fill_pattern(&mut self.pattern, t);
+                let frame = self.pattern.frame();
                 if let Err(e) = r.set_video(&frame) {
                     eprintln!("upload: {e}");
                     return;
                 }
-                // OSD demo bar near the top.
+                // OSD demo bar near the top (copies into GPU memory;
+                // no need to keep the buffer alive afterwards).
                 let rect = osd_rect(180, 36);
-                let rect: &'static [u8] = Box::leak(rect.into_boxed_slice());
                 r.clear_osd();
                 let add = r.add_osd(&Bitmap {
-                    data: rect,
+                    data: &rect,
                     width: 180,
                     height: 36,
                     x: 24,
@@ -147,6 +179,7 @@ fn main() {
     let mut app = App {
         renderer: None,
         window: None,
+        pattern: PatternBuf::new(256, 144),
         start: std::time::Instant::now(),
     };
     loop_handle.run_app(&mut app).expect("run");

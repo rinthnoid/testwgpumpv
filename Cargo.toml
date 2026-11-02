@@ -1,6 +1,6 @@
 [package]
 name = "bwgpu"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 # Verified with `cargo +1.86 check --locked --all-targets` against
 # Cargo.lock; the CI keeps this honest with an msrv job.

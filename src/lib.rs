@@ -81,7 +81,8 @@ pub struct Renderer {
 impl Renderer {
     /// Headless renderer (offscreen rendering + readback only).
     pub fn new(width: u32, height: u32) -> Result<Self> {
-        Self::create(None, width.max(1), height.max(1), true)
+        let instance = Self::instance();
+        Self::create(&instance, None, width.max(1), height.max(1), true)
     }
 
     /// Renderer targeting a native window.
@@ -96,21 +97,29 @@ impl Renderer {
                 .create_surface_unsafe(target)
                 .map_err(|e| Error::Init(format!("create_surface: {e}")))?
         };
-        Self::create(Some(surface), width.max(1), height.max(1), vsync)
+        Self::create(&instance, Some(surface), width.max(1), height.max(1), vsync)
     }
 
     fn instance() -> wgpu::Instance {
         wgpu::Instance::new(&wgpu::InstanceDescriptor::default())
     }
 
+    /// Shared construction path. `surface` MUST have been created from the
+    /// same `wgpu::Instance` that is passed in: wgpu tracks every surface in
+    /// its creating instance's resource hub, and `request_adapter` with a
+    /// foreign `compatible_surface` looks the id up in the wrong hub and
+    /// panics ("Surface[..] does not exist", wgpu-core `storage.rs::get`).
+    /// The surface, adapter and device below therefore always share exactly
+    /// one instance. Letting the local `instance` handle drop afterwards is
+    /// fine — every wgpu resource holds its own `Arc` to the shared context.
     fn create(
+        instance: &wgpu::Instance,
         surface: Option<wgpu::Surface<'static>>,
         width: u32,
         height: u32,
         vsync: bool,
     ) -> Result<Self> {
-        let instance = Self::instance();
-        let gpu = Gpu::new(&instance, surface.as_ref())?;
+        let gpu = Gpu::new(instance, surface.as_ref())?;
 
         let surface_config = surface.as_ref().map(|s| {
             let caps = s.get_capabilities(&gpu.adapter);
