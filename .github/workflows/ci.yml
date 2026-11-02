@@ -87,6 +87,29 @@ jobs:
       - name: Build with MSRV
         run: cargo check --locked --all-targets
 
+  # Early warning for Android breakage on every push: type/metadata
+  # check for the arm64 Android target. cargo check does not link, so
+  # this needs no NDK; the release workflow does the full NDK build.
+  android-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-Linux-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-Linux-
+
+      - name: Add target + check
+        run: |
+          rustup target add aarch64-linux-android
+          cargo check --locked --lib --target aarch64-linux-android
+
   # The C ABI + mpv glue gate. Runs the full pixel verification where a
   # real (or lavapipe) adapter exists; skips cleanly where it does not.
   # On Linux the skip is escalated to a failure (BWGPU_REQUIRE_GPU=1)

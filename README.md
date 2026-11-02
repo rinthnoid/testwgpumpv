@@ -79,6 +79,9 @@ archives — plus `SHA256SUMS` — to a GitHub Release:
 | `bwgpu-<v>-x86_64-apple-darwin.tar.gz` | `libbwgpu.dylib`, `libbwgpu.a`, `player` (Intel) |
 | `bwgpu-<v>-aarch64-apple-darwin.tar.gz` | same (Apple Silicon) |
 | `bwgpu-<v>-macos-universal2.tar.gz` | both macOS architectures `lipo`-merged |
+| `bwgpu-<v>-aarch64-linux-android.tar.gz` | `libbwgpu.so` + `libbwgpu.a` + `ANDROID.txt` (arm64-v8a, API 24+, Vulkan device; no demo binary) |
+| `bwgpu-<v>-armv7-linux-androideabi.tar.gz` | same (armeabi-v7a) |
+| `bwgpu-<v>-x86_64-linux-android.tar.gz` | same (x86_64 emulator) |
 
 Every archive carries `include/bwgpu.h`, `LICENSE` and `README.md`.
 To publish a release: push the repo to GitHub, then tag — no other

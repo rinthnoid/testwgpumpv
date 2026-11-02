@@ -56,6 +56,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Bump when the packaging logic changes; shows up in the run log so
+      # a stale workflow file (re-run of an old commit, wrong branch) is
+      # immediately obvious.
+      - name: Workflow revision
+        shell: bash
+        run: echo "release.yml revision 3 (examples/ fix + universal path fix + android)"
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -120,12 +127,28 @@ jobs:
           D=target/$T/release
           V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           NAME="bwgpu-$V-$T"
+
+          # Locate the demo binary (cargo builds examples into
+          # <profile>/examples/; be tolerant of layout surprises and say
+          # exactly what is missing instead of a bare "cp: cannot stat").
+          EXE=player
+          if [ "$RUNNER_OS" = Windows ]; then EXE=player.exe; fi
+          PLAYER=$(find "$D" -maxdepth 2 -type f -name "$EXE" | head -1 || true)
+          if [ -z "$PLAYER" ]; then
+              echo "FAIL - demo binary '$EXE' not found under $D" >&2
+              echo "--- contents of $D: ---" >&2
+              ls -la "$D" >&2 || true
+              ls -la "$D/examples" >&2 || true
+              exit 1
+          fi
+          echo "demo binary: $PLAYER"
+
           mkdir -p "dist/$NAME/include" "dist/$NAME/lib" "dist/$NAME/bin"
           cp include/bwgpu.h "dist/$NAME/include/"
           cp README.md LICENSE "dist/$NAME/"
           case "$RUNNER_OS" in
             Linux)
-              cp "$D/examples/player" "dist/$NAME/bin/"
+              cp "$PLAYER" "dist/$NAME/bin/"
               cp "$D/libbwgpu.a" "dist/$NAME/lib/"
               if [ -f "$D/libbwgpu.so" ]; then
                   cp "$D/libbwgpu.so" "dist/$NAME/lib/"
@@ -139,14 +162,14 @@ jobs:
               rm -rf "dist/$NAME"
               ;;
             macOS)
-              cp "$D/examples/player" "dist/$NAME/bin/"
+              cp "$PLAYER" "dist/$NAME/bin/"
               cp "$D/libbwgpu.dylib" "dist/$NAME/lib/"
               cp "$D/libbwgpu.a" "dist/$NAME/lib/"
               tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
               rm -rf "dist/$NAME"
               ;;
             Windows)
-              cp "$D/examples/player.exe" "dist/$NAME/bin/"
+              cp "$PLAYER" "dist/$NAME/bin/"
               cp "$D/bwgpu.dll" "$D/bwgpu.dll.lib" "$D/bwgpu.lib" "dist/$NAME/lib/"
               (cd dist && 7z a "$NAME.zip" "$NAME")
               rm -rf "dist/$NAME"
@@ -183,12 +206,23 @@ jobs:
           V=${BASE#bwgpu-}; V=${V%-x86_64-apple-darwin}
           NAME="bwgpu-$V-macos-universal2"
           mkdir -p merged "$NAME/include" "$NAME/lib" "$NAME/bin"
-          # Extract into merged/ so the globs below are unambiguous (dl/
-          # also contains the raw artifact directories).
+          # The packaging step archives the directory "bwgpu-$V-<target>",
+          # so the extracted paths are deterministic. Do NOT glob into a
+          # variable: 'X=dir/*-*' stays literal (no pathname expansion in
+          # assignments) and quoted use then breaks cp - exactly the
+          # 'merged/bwgpu-*-...: No such file or directory' failure.
+          X64="merged/bwgpu-$V-x86_64-apple-darwin"
+          ARM="merged/bwgpu-$V-aarch64-apple-darwin"
           tar -xzf dl/bwgpu-x86_64-apple-darwin/bwgpu-*-x86_64-apple-darwin.tar.gz -C merged/
           tar -xzf dl/bwgpu-aarch64-apple-darwin/bwgpu-*-aarch64-apple-darwin.tar.gz -C merged/
-          X64=merged/bwgpu-*-x86_64-apple-darwin
-          ARM=merged/bwgpu-*-aarch64-apple-darwin
+          for D in "$X64" "$ARM"; do
+              if [ ! -d "$D" ]; then
+                  echo "FAIL - expected extracted directory '$D' not found" >&2
+                  echo "--- contents of merged/: ---" >&2
+                  ls -la merged/ >&2 || true
+                  exit 1
+              fi
+          done
           cp "$X64/include/bwgpu.h" "$NAME/include/"
           cp "$X64/README.md" "$X64/LICENSE" "$NAME/"
           lipo -create -output "$NAME/lib/libbwgpu.dylib" \
@@ -207,10 +241,107 @@ jobs:
           path: bwgpu-*-macos-universal2.tar.gz
           if-no-files-found: error
 
+  # Android: one NDK install (checksum-pinned, cached), three ABIs.
+  # libbwgpu.so is what an APK links/loads; the demo player is skipped
+  # because winit on Android needs an android-activity entry point
+  # instead of a plain binary. wgpu renders through its Vulkan backend.
+  android:
+    timeout-minutes: 45
+    runs-on: ubuntu-22.04
+    env:
+      NDK_URL: https://dl.google.com/android/repository/android-ndk-r30-linux.zip
+      NDK_SHA1: 5107f898313790e449e87eee2183d9a20602dee9
+      ANDROID_API: 24
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-Linux-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-Linux-
+
+      - name: Cache NDK
+        id: ndk
+        uses: actions/cache@v4
+        with:
+          path: ~/ndk
+          key: android-ndk-r30-linux
+
+      - name: Download NDK (checksum-pinned)
+        if: steps.ndk.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o /tmp/ndk.zip "$NDK_URL"
+          echo "$NDK_SHA1  /tmp/ndk.zip" | sha1sum -c -
+          mkdir -p /tmp/ndk-unpack
+          unzip -q /tmp/ndk.zip -d /tmp/ndk-unpack
+          mv /tmp/ndk-unpack/android-ndk-* ~/ndk
+          rm -rf /tmp/ndk-unpack /tmp/ndk.zip
+
+      - name: Add Android rust targets
+        run: rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+
+      - name: Build + package (3 ABIs)
+        shell: bash
+        run: |
+          set -eu
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          TC="$HOME/ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          if [ ! -x "$TC/llvm-strip" ]; then
+              echo "FAIL - NDK toolchain not found at $TC" >&2
+              ls -la ~/ndk 2>/dev/null || true
+              exit 1
+          fi
+          for T in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android; do
+              case "$T" in
+                  aarch64-linux-android)   TRIPLE=aarch64-linux-android ;;
+                  armv7-linux-androideabi) TRIPLE=armv7a-linux-androideabi ;;
+                  x86_64-linux-android)    TRIPLE=x86_64-linux-android ;;
+              esac
+              # cargo env names use underscores: CARGO_TARGET_<TRIPLE>_LINKER
+              ENV_T=$(echo "$T" | tr 'a-z-' 'A-Z_')
+              export "CARGO_TARGET_${ENV_T}_LINKER=$TC/${TRIPLE}${ANDROID_API}-clang"
+              echo "== $T (linker: $TC/${TRIPLE}${ANDROID_API}-clang) =="
+              cargo build --locked --release --target "$T" --lib
+              "$TC/llvm-strip" --strip-unneeded "target/$T/release/libbwgpu.so"
+              NAME="bwgpu-$V-$T"
+              mkdir -p "dist/$NAME/include" "dist/$NAME/lib"
+              cp include/bwgpu.h "dist/$NAME/include/"
+              cp README.md LICENSE "dist/$NAME/"
+              cp "target/$T/release/libbwgpu.so" "target/$T/release/libbwgpu.a" "dist/$NAME/lib/"
+              {
+                  echo "bwgpu for Android ($T)"
+                  echo
+                  echo "minSdk/API: $ANDROID_API (Android 7.0+)."
+                  echo "wgpu renders through its Vulkan backend: a Vulkan-capable"
+                  echo "device is required. There is no demo binary here - winit on"
+                  echo "Android needs an android-activity entry point, not a plain"
+                  echo "executable."
+                  echo
+                  echo "lib/libbwgpu.so : the cdylib an APK loads (System.loadLibrary)"
+                  echo "                  or links directly from the mpv Android build."
+                  echo "lib/libbwgpu.a  : static lib for linking into a custom build."
+                  echo "include/bwgpu.h : the stable C ABI (see README for the surface)."
+              } > "dist/$NAME/ANDROID.txt"
+              tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
+              rm -rf "dist/$NAME"
+          done
+          ls -l dist/
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bwgpu-android
+          path: dist/
+          if-no-files-found: error
+
   # Attach everything to a GitHub Release (tag pushes only).
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, universal]
+    needs: [build, universal, android]
     timeout-minutes: 15
     runs-on: ubuntu-latest
     permissions:
@@ -245,6 +376,9 @@ jobs:
           - Windows archives: bwgpu.dll + import library (bwgpu.dll.lib)
             + static lib (bwgpu.lib) + player.exe.
           - macOS: per-arch archives plus a universal2 (lipo) archive.
+          - Android: libbwgpu.so + libbwgpu.a for arm64-v8a,
+            armeabi-v7a and the x86_64 emulator (API 24+, Vulkan device;
+            no demo binary by design).
 
           Each archive carries include/bwgpu.h, LICENSE and README.md." \
               --generate-notes
