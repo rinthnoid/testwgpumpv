@@ -91,24 +91,25 @@ jobs:
         run: |
           T=${{ matrix.target }}
           D=target/$T/release
+          P="$D/examples/player"   # examples build to <profile>/examples/
           case "$RUNNER_OS" in
             Linux)
               if [ "$T" = "x86_64-unknown-linux-gnu" ]; then
-                  strip --strip-unneeded "$D/libbwgpu.so" "$D/player" 2>/dev/null || true
+                  strip --strip-unneeded "$D/libbwgpu.so" "$P" 2>/dev/null || true
               elif [ "$T" = "aarch64-unknown-linux-gnu" ]; then
-                  aarch64-linux-gnu-strip --strip-unneeded "$D/libbwgpu.so" "$D/player" 2>/dev/null || true
+                  aarch64-linux-gnu-strip --strip-unneeded "$D/libbwgpu.so" "$P" 2>/dev/null || true
               else
                   # musl: cdylib is dropped (static-only target); only the
                   # static player binary exists to strip.
-                  strip --strip-unneeded "$D/player" 2>/dev/null || true
+                  strip --strip-unneeded "$P" 2>/dev/null || true
               fi
               ;;
             macOS)
-              strip -x "$D/libbwgpu.dylib" "$D/player" 2>/dev/null || true
+              strip -x "$D/libbwgpu.dylib" "$P" 2>/dev/null || true
               ;;
             Windows)
               command -v llvm-strip >/dev/null 2>&1 && \
-                  llvm-strip "$D/bwgpu.dll" "$D/player.exe" 2>/dev/null || true
+                  llvm-strip "$D/bwgpu.dll" "$P.exe" 2>/dev/null || true
               ;;
           esac
 
@@ -124,7 +125,7 @@ jobs:
           cp README.md LICENSE "dist/$NAME/"
           case "$RUNNER_OS" in
             Linux)
-              cp "$D/player" "dist/$NAME/bin/"
+              cp "$D/examples/player" "dist/$NAME/bin/"
               cp "$D/libbwgpu.a" "dist/$NAME/lib/"
               if [ -f "$D/libbwgpu.so" ]; then
                   cp "$D/libbwgpu.so" "dist/$NAME/lib/"
@@ -138,14 +139,14 @@ jobs:
               rm -rf "dist/$NAME"
               ;;
             macOS)
-              cp "$D/player" "dist/$NAME/bin/"
+              cp "$D/examples/player" "dist/$NAME/bin/"
               cp "$D/libbwgpu.dylib" "dist/$NAME/lib/"
               cp "$D/libbwgpu.a" "dist/$NAME/lib/"
               tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
               rm -rf "dist/$NAME"
               ;;
             Windows)
-              cp "$D/player.exe" "dist/$NAME/bin/"
+              cp "$D/examples/player.exe" "dist/$NAME/bin/"
               cp "$D/bwgpu.dll" "$D/bwgpu.dll.lib" "$D/bwgpu.lib" "dist/$NAME/lib/"
               (cd dist && 7z a "$NAME.zip" "$NAME")
               rm -rf "dist/$NAME"
