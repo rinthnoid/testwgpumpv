@@ -6,9 +6,10 @@ name: release
 #                      a GitHub Release (plus SHA256SUMS)
 #   manual dispatch -> builds all targets, artifacts on the run page only
 #
-# Every archive carries include/bwgpu.h, LICENSE, README.md, the cdylib
-# (except musl, which is static-only by musl design) and the `player`
-# demo binary so the artifact can be sanity-run on a matching machine.
+# Every archive carries include/bwgpu.h, LICENSE and README.md, plus the
+# cdylib (except musl, which is static-only by design) and the `player`
+# demo binary (except Android, where winit needs an android-activity
+# entry point instead of a plain executable).
 
 on:
   push:
@@ -61,7 +62,7 @@ jobs:
       # immediately obvious.
       - name: Workflow revision
         shell: bash
-        run: echo "release.yml revision 3 (examples/ fix + universal path fix + android)"
+        run: echo "release.yml revision 4 (android verified against NDK r30, ABI set fixed)"
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -282,9 +283,14 @@ jobs:
           rm -rf /tmp/ndk-unpack /tmp/ndk.zip
 
       - name: Add Android rust targets
-        run: rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+        # armv7-linux-androideabi is deliberately absent: NDK r27+ ships no
+        # arm libunwind, so rustc's `-lunwind` cannot resolve (verified
+        # against NDK r30: "ld.lld: error: unable to find library -lunwind"),
+        # and wgpu renders through Vulkan anyway — a capability that arrived
+        # with the arm64 device generation. arm64-v8a + x86_64 cover it.
+        run: rustup target add aarch64-linux-android x86_64-linux-android
 
-      - name: Build + package (3 ABIs)
+      - name: Build + package (arm64-v8a + x86_64)
         shell: bash
         run: |
           set -eu
@@ -295,10 +301,9 @@ jobs:
               ls -la ~/ndk 2>/dev/null || true
               exit 1
           fi
-          for T in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android; do
+          for T in aarch64-linux-android x86_64-linux-android; do
               case "$T" in
                   aarch64-linux-android)   TRIPLE=aarch64-linux-android ;;
-                  armv7-linux-androideabi) TRIPLE=armv7a-linux-androideabi ;;
                   x86_64-linux-android)    TRIPLE=x86_64-linux-android ;;
               esac
               # cargo env names use underscores: CARGO_TARGET_<TRIPLE>_LINKER
@@ -376,9 +381,9 @@ jobs:
           - Windows archives: bwgpu.dll + import library (bwgpu.dll.lib)
             + static lib (bwgpu.lib) + player.exe.
           - macOS: per-arch archives plus a universal2 (lipo) archive.
-          - Android: libbwgpu.so + libbwgpu.a for arm64-v8a,
-            armeabi-v7a and the x86_64 emulator (API 24+, Vulkan device;
-            no demo binary by design).
+          - Android: libbwgpu.so + libbwgpu.a for arm64-v8a and the
+            x86_64 emulator (API 24+, Vulkan-capable device; no demo
+            binary by design — winit needs an android-activity entry).
 
           Each archive carries include/bwgpu.h, LICENSE and README.md." \
               --generate-notes
