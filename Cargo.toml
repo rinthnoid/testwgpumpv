@@ -1,0 +1,42 @@
+[package]
+name = "bwgpu"
+version = "0.1.0"
+edition = "2021"
+# Verified with `cargo +1.86 check --locked --all-targets` against
+# Cargo.lock; the CI keeps this honest with an msrv job.
+rust-version = "1.86"
+license = "GPL-2.0-or-later"
+description = "mpv, rebased on wgpu — the one and only video renderer backend"
+repository = "https://github.com/mpv-wgpu/mpv-wgpu"
+readme = "README.md"
+keywords = ["mpv", "wgpu", "video", "renderer", "wgsl"]
+categories = ["multimedia::video", "rendering::graphics-api"]
+
+[lib]
+name = "bwgpu"
+# cdylib: the shared library the C smoke test links (and the simplest
+#   integration route for mpv).
+# staticlib: for embedding into the mpv binary directly (see
+#   mpv-glue/INSTALL.md).
+# rlib: Rust-side tests and the winit example.
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+# The entire dependency tree is wgpu + glue. There is no platform render
+# backend in this project: no OpenGL, no Vulkan-in-C, no D3D11, no Android
+# media codecs, no placebo. wgpu picks the native backend per platform
+# (DX12 / Vulkan / Metal) and everything else rides on top of it.
+[dependencies]
+wgpu = "25"
+raw-window-handle = "0.6"
+bytemuck = { version = "1", features = ["derive"] }
+log = "0.4"
+pollster = "0.4"
+
+[dev-dependencies]
+winit = "0.30"
+env_logger = "0.11"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

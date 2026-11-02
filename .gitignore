@@ -1,0 +1,8 @@
+/target
+Cargo.lock.orig
+*.so
+*.dll
+*.dylib
+/build
+scripts/mpv_stub/config.h
+*.ppm

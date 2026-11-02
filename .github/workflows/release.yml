@@ -1,0 +1,249 @@
+name: release
+
+# Cross-compiled release binaries for every wgpu platform.
+#
+#   tag push (v*)   -> builds all targets, then attaches the archives to
+#                      a GitHub Release (plus SHA256SUMS)
+#   manual dispatch -> builds all targets, artifacts on the run page only
+#
+# Every archive carries include/bwgpu.h, LICENSE, README.md, the cdylib
+# (except musl, which is static-only by musl design) and the `player`
+# demo binary so the artifact can be sanity-run on a matching machine.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Strip explicitly in the packaging step (with the right per-platform
+  # tool) instead of trusting cargo's cross-target strip behavior.
+  CARGO_PROFILE_RELEASE_STRIP: "false"
+
+jobs:
+  build:
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- Linux ------------------------------------------------
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            apt: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            apt: musl-tools
+            linker: musl-gcc
+          # --- Windows -----------------------------------------------
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+          # --- macOS -------------------------------------------------
+          - target: x86_64-apple-darwin
+            os: macos-latest        # arm64 runner, Apple SDK cross-links
+          - target: aarch64-apple-darwin
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Install cross toolchain (Linux)
+        if: matrix.apt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Configure cross linker
+        if: matrix.linker
+        shell: bash
+        run: |
+          VAR="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER"
+          echo "$VAR=${{ matrix.linker }}" >> "$GITHUB_ENV"
+
+      - name: Add rust target
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build (lib + demo player)
+        shell: bash
+        run: cargo build --locked --release --target ${{ matrix.target }} --lib --example player
+
+      - name: Strip link products
+        shell: bash
+        run: |
+          T=${{ matrix.target }}
+          D=target/$T/release
+          case "$RUNNER_OS" in
+            Linux)
+              if [ "$T" = "x86_64-unknown-linux-gnu" ]; then
+                  strip --strip-unneeded "$D/libbwgpu.so" "$D/player" 2>/dev/null || true
+              elif [ "$T" = "aarch64-unknown-linux-gnu" ]; then
+                  aarch64-linux-gnu-strip --strip-unneeded "$D/libbwgpu.so" "$D/player" 2>/dev/null || true
+              else
+                  # musl: cdylib is dropped (static-only target); only the
+                  # static player binary exists to strip.
+                  strip --strip-unneeded "$D/player" 2>/dev/null || true
+              fi
+              ;;
+            macOS)
+              strip -x "$D/libbwgpu.dylib" "$D/player" 2>/dev/null || true
+              ;;
+            Windows)
+              command -v llvm-strip >/dev/null 2>&1 && \
+                  llvm-strip "$D/bwgpu.dll" "$D/player.exe" 2>/dev/null || true
+              ;;
+          esac
+
+      - name: Package
+        shell: bash
+        run: |
+          T=${{ matrix.target }}
+          D=target/$T/release
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          NAME="bwgpu-$V-$T"
+          mkdir -p "dist/$NAME/include" "dist/$NAME/lib" "dist/$NAME/bin"
+          cp include/bwgpu.h "dist/$NAME/include/"
+          cp README.md LICENSE "dist/$NAME/"
+          case "$RUNNER_OS" in
+            Linux)
+              cp "$D/player" "dist/$NAME/bin/"
+              cp "$D/libbwgpu.a" "dist/$NAME/lib/"
+              if [ -f "$D/libbwgpu.so" ]; then
+                  cp "$D/libbwgpu.so" "dist/$NAME/lib/"
+              else
+                  # musl is static-only: no .so is produced (cargo prints
+                  # "dropping unsupported crate type cdylib"). The fully
+                  # static libbwgpu.a + static player are the artifact.
+                  echo "no cdylib: static-only target" > "dist/$NAME/STATIC.txt"
+              fi
+              tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
+              rm -rf "dist/$NAME"
+              ;;
+            macOS)
+              cp "$D/player" "dist/$NAME/bin/"
+              cp "$D/libbwgpu.dylib" "dist/$NAME/lib/"
+              cp "$D/libbwgpu.a" "dist/$NAME/lib/"
+              tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
+              rm -rf "dist/$NAME"
+              ;;
+            Windows)
+              cp "$D/player.exe" "dist/$NAME/bin/"
+              cp "$D/bwgpu.dll" "$D/bwgpu.dll.lib" "$D/bwgpu.lib" "dist/$NAME/lib/"
+              (cd dist && 7z a "$NAME.zip" "$NAME")
+              rm -rf "dist/$NAME"
+              ;;
+          esac
+          ls -l dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bwgpu-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  # macOS universal binary: lipo the two single-arch dylibs/static libs.
+  universal:
+    needs: build
+    timeout-minutes: 15
+    runs-on: macos-14
+    steps:
+      - name: Download the two macOS builds
+        uses: actions/download-artifact@v4
+        with:
+          path: dl/
+
+      - name: lipo -> universal2
+        shell: bash
+        run: |
+          set -eu
+          # No checkout in this job: take the version from the archive name
+          # (bwgpu-<ver>-x86_64-apple-darwin.tar.gz).
+          ARCH=$(ls dl/bwgpu-x86_64-apple-darwin/bwgpu-*-x86_64-apple-darwin.tar.gz)
+          BASE=$(basename "$ARCH" .tar.gz)
+          V=${BASE#bwgpu-}; V=${V%-x86_64-apple-darwin}
+          NAME="bwgpu-$V-macos-universal2"
+          mkdir -p merged "$NAME/include" "$NAME/lib" "$NAME/bin"
+          # Extract into merged/ so the globs below are unambiguous (dl/
+          # also contains the raw artifact directories).
+          tar -xzf dl/bwgpu-x86_64-apple-darwin/bwgpu-*-x86_64-apple-darwin.tar.gz -C merged/
+          tar -xzf dl/bwgpu-aarch64-apple-darwin/bwgpu-*-aarch64-apple-darwin.tar.gz -C merged/
+          X64=merged/bwgpu-*-x86_64-apple-darwin
+          ARM=merged/bwgpu-*-aarch64-apple-darwin
+          cp "$X64/include/bwgpu.h" "$NAME/include/"
+          cp "$X64/README.md" "$X64/LICENSE" "$NAME/"
+          lipo -create -output "$NAME/lib/libbwgpu.dylib" \
+              "$X64/lib/libbwgpu.dylib" "$ARM/lib/libbwgpu.dylib"
+          lipo -create -output "$NAME/lib/libbwgpu.a" \
+              "$X64/lib/libbwgpu.a" "$ARM/lib/libbwgpu.a"
+          lipo -create -output "$NAME/bin/player" \
+              "$X64/bin/player" "$ARM/bin/player"
+          tar -czf "$NAME.tar.gz" "$NAME"
+          echo "built $NAME.tar.gz: $(lipo -info "$NAME/lib/libbwgpu.dylib")"
+
+      - name: Upload universal artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bwgpu-macos-universal2
+          path: bwgpu-*-macos-universal2.tar.gz
+          if-no-files-found: error
+
+  # Attach everything to a GitHub Release (tag pushes only).
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, universal]
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum bwgpu-*.tar.gz bwgpu-*.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # No checkout in this job: derive the version from the tag.
+          V=${GITHUB_REF_NAME#v}
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+              --title "bwgpu $V" \
+              --notes "Cross-compiled binaries for all wgpu platforms.
+
+          - Linux gnu archives: libbwgpu.so + libbwgpu.a + demo player
+            (x86_64 built on ubuntu-22.04 for broad glibc compatibility;
+            aarch64 cross-compiled).
+          - Linux musl archive: fully static libbwgpu.a + static player
+            (musl is a static-only target; there is no .so by design).
+          - Windows archives: bwgpu.dll + import library (bwgpu.dll.lib)
+            + static lib (bwgpu.lib) + player.exe.
+          - macOS: per-arch archives plus a universal2 (lipo) archive.
+
+          Each archive carries include/bwgpu.h, LICENSE and README.md." \
+              --generate-notes

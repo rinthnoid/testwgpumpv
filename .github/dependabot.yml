@@ -1,0 +1,21 @@
+version: 2
+updates:
+  # GitHub Actions: pin-bump the workflows weekly.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']
+
+  # Cargo: update the locked graph weekly. PRs only land after CI (incl.
+  # the msrv job) passes, so a dep bump that breaks the MSRV claim is
+  # caught before merge.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types: ['minor', 'patch']

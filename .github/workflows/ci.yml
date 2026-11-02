@@ -1,0 +1,171 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Rust gate: build + test + clippy + fmt on every OS wgpu supports.
+  # GPU tests run for real wherever an adapter exists (lavapipe on Linux,
+  # WARP/DX12 on Windows runners, Metal on macOS runners) and skip with a
+  # printed notice where there is none.
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Install lavapipe (software Vulkan) on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers
+
+      - name: Build
+        run: cargo build --locked --all-targets
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        if: runner.os == 'Linux'
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Format
+        if: runner.os == 'Linux'
+        run: cargo fmt --check
+
+      - name: Example (GPU backends only)
+        if: runner.os != 'Linux'
+        run: cargo build --locked --release --example player
+
+  # Keep the Cargo.toml rust-version claim honest: build with the exact
+  # MSRV toolchain against the locked dependency graph.
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-msrv-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-msrv-
+
+      - name: Install MSRV toolchain
+        run: |
+          rustup toolchain install $(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1) --profile minimal
+          rustup default $(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+
+      - name: Build with MSRV
+        run: cargo check --locked --all-targets
+
+  # The C ABI + mpv glue gate. Runs the full pixel verification where a
+  # real (or lavapipe) adapter exists; skips cleanly where it does not.
+  # On Linux the skip is escalated to a failure (BWGPU_REQUIRE_GPU=1)
+  # because lavapipe makes a working adapter deterministic there.
+  c-abi:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      BWGPU_REQUIRE_GPU: ${{ runner.os == 'Linux' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Install lavapipe + toolchain on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers
+
+      - name: C smoke test (Linux / macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: sh scripts/c_smoke.sh
+
+      # windows-latest ships clang; the script links the MSVC import
+      # library (bwgpu.dll.lib) and runs against the cdylib directly.
+      - name: C smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          CC: clang
+        run: sh scripts/c_smoke.sh
+
+      - name: vo_wgpu glue syntax check (x11 / wayland / win32 stubs)
+        if: runner.os == 'Linux'
+        run: sh scripts/check_vo_wgpu.sh
+
+      - name: strip_mpv.py unit pass (synthetic vo.c)
+        if: runner.os == 'Linux'
+        run: |
+          python3 - <<'EOF'
+          import subprocess, tempfile, os
+          src = '''
+          extern const struct vo_driver video_out_gpu_next;
+          extern const struct vo_driver video_out_null;
+          static const struct vo_driver *const video_out_drivers[] =
+          {
+          &video_out_gpu_next,
+          &video_out_gpu,
+          #if HAVE_VDPAU
+          &video_out_vdpau,
+          #endif
+          #if HAVE_X11
+          &video_out_x11,
+          #endif
+          &video_out_null,
+          };
+          '''
+          with tempfile.NamedTemporaryFile('w', suffix='.c', delete=False) as f:
+              f.write(src)
+              p = f.name
+          subprocess.run(['python3', 'scripts/strip_mpv.py', p], check=True)
+          out = open(p).read()
+          assert '&video_out_wgpu,' in out, out
+          assert 'video_out_gpu' not in out, out
+          assert 'video_out_vdpau' not in out, out
+          assert '&video_out_null,' in out, out
+          assert out.count('&video_out_wgpu') == 1, out
+          os.unlink(p)
+          print('strip_mpv.py: synthetic vo.c pass')
+          EOF
