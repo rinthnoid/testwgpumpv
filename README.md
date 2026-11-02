@@ -40,6 +40,7 @@ scripts/
   mpv_stub/              stub mpv headers for the syntax check
 tests/
   uniform_layout.rs      Rust/WGSL/C-header layout drift guards (no GPU)
+  wgsl_parse.rs          naga parse+validate gate for every shader (no GPU)
   render_roundtrip.rs    GPU output vs f64 CPU reference (skips w/o GPU)
 ```
 
@@ -66,7 +67,7 @@ Strip the legacy stack out of an mpv checkout:
 
 CI builds and tests every push on Windows, Linux and macOS; the
 `release` workflow cross-compiles the C library for all targets below
-on a tag push (`git tag v0.1.1 && git push --tags`) and attaches the
+on a tag push (`git tag v0.1.2 && git push --tags`) and attaches the
 archives — plus `SHA256SUMS` — to a GitHub Release:
 
 | Archive | Contents |
@@ -106,6 +107,12 @@ built-in `GITHUB_TOKEN`).
   reference in the roundtrip test all consume the same numbers — the
   affine coefficients are derived by evaluating one function at basis
   points. There is no second formula to drift.
+- **Shaders cannot drift without failing a build.** `tests/wgsl_parse.rs`
+  runs every WGSL file through the same naga front-end wgpu uses — on any
+  machine, no GPU needed. This is the guard that would have caught the
+  0.1.0/0.1.1 startup panic (a reserved keyword in a shader parameter).
+  At runtime, shader compilation additionally runs inside a validation
+  error scope, so a bad module surfaces as a clean `Err`, never a panic.
 - **Layout drift cannot compile silently.** `tests/uniform_layout.rs`
   asserts Rust struct sizes/offsets, parses the WGSL struct fields,
   checks shader binding numbers and the C header enum values.

@@ -82,11 +82,21 @@ impl Gpu {
 
     /// Compile a WGSL module. Shaders are embedded at build time
     /// (`include_str!`), so there is no runtime file dependency.
-    pub fn module(&self, src: &'static str, label: &str) -> ShaderModule {
-        self.device
+    ///
+    /// Wrapped in a validation error scope: a bad shader surfaces as a
+    /// normal `Err` carrying the naga diagnostic, instead of the default
+    /// "Handling wgpu errors as fatal by default" process panic.
+    pub fn module(&self, src: &'static str, label: &str) -> Result<ShaderModule> {
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let module = self
+            .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(label),
                 source: wgpu::ShaderSource::Wgsl(src.into()),
-            })
+            });
+        if let Some(e) = pollster::block_on(self.device.pop_error_scope()) {
+            return Err(Error::Init(format!("shader '{label}': {e}")));
+        }
+        Ok(module)
     }
 }

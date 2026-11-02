@@ -152,9 +152,9 @@ impl Renderer {
         // Pre-build pipelines for the known target formats so first-frame
         // hitches don't include shader compilation.
         if let Some(cfg) = &renderer.surface_config {
-            renderer.ensure_pipes(cfg.format);
+            renderer.ensure_pipes(cfg.format)?;
         }
-        renderer.ensure_pipes(wgpu::TextureFormat::Rgba8Unorm);
+        renderer.ensure_pipes(wgpu::TextureFormat::Rgba8Unorm)?;
         // Push the initial uniform block (safe idle defaults: bilinear,
         // 8-bit, full-surface rect) so every draw is well-defined.
         renderer.apply_rect();
@@ -163,15 +163,15 @@ impl Renderer {
 
     /// Build (and cache) the pipeline pair for a target format. Pipelines
     /// are `Arc`-backed, so the clone handed to the draw path is cheap.
-    fn ensure_pipes(&mut self, format: wgpu::TextureFormat) -> Pipes {
+    fn ensure_pipes(&mut self, format: wgpu::TextureFormat) -> Result<Pipes> {
         if !self.pipes.contains_key(&format) {
             let video_shader = self.gpu.module(
                 include_str!("../shaders/video_blit.wgsl"),
                 "bwgpu-video-blit",
-            );
+            )?;
             let osd_shader = self
                 .gpu
-                .module(include_str!("../shaders/osd_blend.wgsl"), "bwgpu-osd");
+                .module(include_str!("../shaders/osd_blend.wgsl"), "bwgpu-osd")?;
 
             let vpl = self
                 .gpu
@@ -267,7 +267,7 @@ impl Renderer {
 
             self.pipes.insert(format, Pipes { video, osd });
         }
-        self.pipes.get(&format).unwrap().clone()
+        Ok(self.pipes.get(&format).unwrap().clone())
     }
 
     pub fn adapter_name(&self) -> &str {
@@ -516,7 +516,7 @@ impl Renderer {
     /// The one draw: video blit, then OSD quads. Same path for surface and
     /// offscreen targets.
     fn draw(&mut self, view: &TextureView, format: wgpu::TextureFormat) -> Result<()> {
-        let pipes = self.ensure_pipes(format);
+        let pipes = self.ensure_pipes(format)?;
         // Bind groups are rebuilt per frame; OSD item counts are tiny.
         let osd_binds: Vec<BindGroup> = self
             .osd

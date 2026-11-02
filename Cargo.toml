@@ -1,6 +1,6 @@
 [package]
 name = "bwgpu"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 # Verified with `cargo +1.86 check --locked --all-targets` against
 # Cargo.lock; the CI keeps this honest with an msrv job.
@@ -35,6 +35,9 @@ pollster = "0.4"
 [dev-dependencies]
 winit = "0.30"
 env_logger = "0.11"
+# CPU-only WGSL gate (tests/wgsl_parse.rs): same front-end wgpu uses, so
+# shader breakage (e.g. reserved keywords) fails in any environment.
+naga = { version = "25", default-features = false, features = ["wgsl-in"] }
 
 [profile.release]
 lto = "thin"

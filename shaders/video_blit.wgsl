@@ -14,7 +14,7 @@ struct Params {
     mat2: vec4<f32>,  // row 2 of A   (offset 32)
     bias: vec4<f32>,  // rgb bias     (offset 48)
     src:  vec4<f32>,  // y_w, y_h, c_w, c_h (offset 64)
-    misc: vec4<f32>,  // depth_y, depth_c, shift_bits, filter (offset 80)
+    misc: vec4<f32>,  // depth_y, depth_c, shift_bits, filter_kind (offset 80)
     mode: vec4<f32>,  // interleaved, dither_lsb, parity, 0 (offset 96)
     rect: vec4<f32>,  // video dst rect, fractions of target (offset 112)
 };                    // size 128
@@ -100,11 +100,11 @@ fn catmull_rom(tex: texture_2d<u32>, tc: vec2<f32>, size: vec2<f32>, depth: f32,
     return acc;
 }
 
-fn fetch(tex: texture_2d<u32>, tc: vec2<f32>, size: vec2<f32>, depth: f32, shift: f32, filter: u32) -> f32 {
-    if (filter == 0u) {
+fn fetch(tex: texture_2d<u32>, tc: vec2<f32>, size: vec2<f32>, depth: f32, shift: f32, filter_kind: u32) -> f32 {
+    if (filter_kind == 0u) {
         let c = vec2<i32>(clampc(i32(floor(tc.x)), size.x), clampc(i32(floor(tc.y)), size.y));
         return norm(textureLoad(tex, c, 0).r, depth, shift);
-    } else if (filter == 1u) {
+    } else if (filter_kind == 1u) {
         return bilinear(tex, tc, size, depth, shift);
     } else {
         return catmull_rom(tex, tc, size, depth, shift);
@@ -134,7 +134,12 @@ fn bayer(parity: u32) -> array<array<f32, 8>, 8> {
         array<f32, 8>(62.0, 30.0, 54.0, 22.0, 60.0, 28.0, 52.0, 20.0),
         array<f32, 8>(14.0, 46.0,  6.0, 38.0, 12.0, 44.0,  4.0, 36.0),
     );
-    return select(even, odd, parity == 1u);
+    // NB: WGSL `select` accepts only scalars/vectors, not arrays — branch
+    // explicitly (naga validation rejects select on array operands).
+    if (parity == 1u) {
+        return odd;
+    }
+    return even;
 }
 
 @fragment
@@ -156,7 +161,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     }
     let video_uv = (rel - rxy) / rwh;
 
-    let filter = u32(p.misc.w);
+    let filter_kind = u32(p.misc.w);
     let depth_y = p.misc.x;
     let depth_c = p.misc.y;
     let shift = p.misc.z;
@@ -167,7 +172,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let ratio = p.src.zw / p.src.xy;
     let ctc = (ytc + vec2<f32>(0.5)) * ratio;
 
-    let y = fetch(tex_y, ytc, p.src.xy, depth_y, shift, filter);
+    let y = fetch(tex_y, ytc, p.src.xy, depth_y, shift, filter_kind);
 
     var u: f32;
     var v: f32;
@@ -188,8 +193,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         u = norm(u32(ur), depth_c, shift);
         v = norm(u32(vr), depth_c, shift);
     } else {
-        u = fetch(tex_u, ctc, p.src.zw, depth_c, shift, filter);
-        v = fetch(tex_v, ctc, p.src.zw, depth_c, shift, filter);
+        u = fetch(tex_u, ctc, p.src.zw, depth_c, shift, filter_kind);
+        v = fetch(tex_v, ctc, p.src.zw, depth_c, shift, filter_kind);
     }
 
     var rgb = vec3<f32>(
