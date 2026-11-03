@@ -34,10 +34,10 @@ jobs:
     timeout-minutes: 15
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -81,7 +81,7 @@ jobs:
             os: macos-14
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Bump when the packaging logic changes; shows up in the run log so
       # a stale workflow file (re-run of an old commit, wrong branch) is
@@ -91,7 +91,7 @@ jobs:
         run: echo "release.yml revision 5 (shader-validate gate before cross-build)"
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -205,7 +205,7 @@ jobs:
           ls -l dist/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bwgpu-${{ matrix.target }}
           path: dist/
@@ -218,7 +218,7 @@ jobs:
     runs-on: macos-14
     steps:
       - name: Download the two macOS builds
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dl/
 
@@ -262,7 +262,7 @@ jobs:
           echo "built $NAME.tar.gz: $(lipo -info "$NAME/lib/libbwgpu.dylib")"
 
       - name: Upload universal artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bwgpu-macos-universal2
           path: bwgpu-*-macos-universal2.tar.gz
@@ -280,10 +280,10 @@ jobs:
       NDK_SHA1: 5107f898313790e449e87eee2183d9a20602dee9
       ANDROID_API: 24
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -293,7 +293,7 @@ jobs:
 
       - name: Cache NDK
         id: ndk
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/ndk
           key: android-ndk-r30-linux
@@ -363,7 +363,7 @@ jobs:
           ls -l dist/
 
       - name: Upload Android artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bwgpu-android
           path: dist/
@@ -378,7 +378,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist/
           merge-multiple: true
