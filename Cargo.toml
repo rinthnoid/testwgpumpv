@@ -30,7 +30,7 @@ wgpu = "25"
 raw-window-handle = "0.6"
 bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"
-pollster = "0.4"
+pollster = "1.0"
 
 [dev-dependencies]
 winit = "0.30"
