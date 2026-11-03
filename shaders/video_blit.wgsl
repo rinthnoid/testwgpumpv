@@ -34,8 +34,13 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
     // Fullscreen triangle; uv spans [0,1] over the luma plane.
     let xy = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
     let uv = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+    // wgpu's clip space is y-up (NDC -1 = bottom row); uv must follow
+    // FRAMEBUFFER rows (y-down, row 0 on top), so the vertex Y is flipped
+    // here exactly like osd_blend.wgsl does. Without the flip the video
+    // renders vertically mirrored (caught by the roundtrip test: the V
+    // ramp comes out upside down).
     return VSOut(
-        vec4<f32>(xy * 2.0 - 1.0, 0.0, 1.0),
+        vec4<f32>(xy.x * 2.0 - 1.0, 1.0 - xy.y * 2.0, 0.0, 1.0),
         uv
     );
 }
@@ -100,11 +105,14 @@ fn catmull_rom(tex: texture_2d<u32>, tc: vec2<f32>, size: vec2<f32>, depth: f32,
     return acc;
 }
 
-fn fetch(tex: texture_2d<u32>, tc: vec2<f32>, size: vec2<f32>, depth: f32, shift: f32, filter: u32) -> f32 {
-    if (filter == 0u) {
+// NOTE: naga 25 reserves `filter` (WGSL reserved words), so the scale
+// filter selector is called `filter_kind` — renaming it back breaks every
+// driver at shader parse time (see tests/shader_validation.rs).
+fn fetch(tex: texture_2d<u32>, tc: vec2<f32>, size: vec2<f32>, depth: f32, shift: f32, filter_kind: u32) -> f32 {
+    if (filter_kind == 0u) {
         let c = vec2<i32>(clampc(i32(floor(tc.x)), size.x), clampc(i32(floor(tc.y)), size.y));
         return norm(textureLoad(tex, c, 0).r, depth, shift);
-    } else if (filter == 1u) {
+    } else if (filter_kind == 1u) {
         return bilinear(tex, tc, size, depth, shift);
     } else {
         return catmull_rom(tex, tc, size, depth, shift);
@@ -112,9 +120,11 @@ fn fetch(tex: texture_2d<u32>, tc: vec2<f32>, size: vec2<f32>, depth: f32, shift
 }
 
 // 8x8 ordered Bayer matrix, rows interleaved by frame parity so dithering
-// does not alias against interlaced content.
-fn bayer(parity: u32) -> array<array<f32, 8>, 8> {
-    let even = array<array<f32, 8>, 8>(
+// does not alias against interlaced content. naga 25 rejects `select` on
+// array operands, so the matrix is picked with an `if` into a `var` —
+// which also allows the dynamic indexing the caller does.
+fn bayer_value(parity: u32, px: vec2<i32>) -> f32 {
+    var m = array<array<f32, 8>, 8>(
         array<f32, 8>( 0.0, 32.0,  8.0, 40.0,  2.0, 34.0, 10.0, 42.0),
         array<f32, 8>(48.0, 16.0, 56.0, 24.0, 50.0, 18.0, 58.0, 26.0),
         array<f32, 8>(12.0, 44.0,  4.0, 36.0, 14.0, 46.0,  6.0, 38.0),
@@ -124,17 +134,19 @@ fn bayer(parity: u32) -> array<array<f32, 8>, 8> {
         array<f32, 8>(15.0, 47.0,  7.0, 39.0, 13.0, 45.0,  5.0, 37.0),
         array<f32, 8>(63.0, 31.0, 55.0, 23.0, 61.0, 29.0, 53.0, 21.0),
     );
-    let odd = array<array<f32, 8>, 8>(
-        array<f32, 8>(49.0, 17.0, 57.0, 25.0, 51.0, 19.0, 59.0, 27.0),
-        array<f32, 8>( 1.0, 33.0,  9.0, 41.0,  3.0, 35.0, 11.0, 43.0),
-        array<f32, 8>(61.0, 29.0, 53.0, 21.0, 63.0, 31.0, 55.0, 23.0),
-        array<f32, 8>(13.0, 45.0,  5.0, 37.0, 15.0, 47.0,  7.0, 39.0),
-        array<f32, 8>(50.0, 18.0, 58.0, 26.0, 48.0, 16.0, 56.0, 24.0),
-        array<f32, 8>( 2.0, 34.0, 10.0, 42.0,  0.0, 32.0,  8.0, 40.0),
-        array<f32, 8>(62.0, 30.0, 54.0, 22.0, 60.0, 28.0, 52.0, 20.0),
-        array<f32, 8>(14.0, 46.0,  6.0, 38.0, 12.0, 44.0,  4.0, 36.0),
-    );
-    return select(even, odd, parity == 1u);
+    if (parity == 1u) {
+        m = array<array<f32, 8>, 8>(
+            array<f32, 8>(49.0, 17.0, 57.0, 25.0, 51.0, 19.0, 59.0, 27.0),
+            array<f32, 8>( 1.0, 33.0,  9.0, 41.0,  3.0, 35.0, 11.0, 43.0),
+            array<f32, 8>(61.0, 29.0, 53.0, 21.0, 63.0, 31.0, 55.0, 23.0),
+            array<f32, 8>(13.0, 45.0,  5.0, 37.0, 15.0, 47.0,  7.0, 39.0),
+            array<f32, 8>(50.0, 18.0, 58.0, 26.0, 48.0, 16.0, 56.0, 24.0),
+            array<f32, 8>( 2.0, 34.0, 10.0, 42.0,  0.0, 32.0,  8.0, 40.0),
+            array<f32, 8>(62.0, 30.0, 54.0, 22.0, 60.0, 28.0, 52.0, 20.0),
+            array<f32, 8>(14.0, 46.0,  6.0, 38.0, 12.0, 44.0,  4.0, 36.0),
+        );
+    }
+    return m[px.y % 8][px.x % 8];
 }
 
 @fragment
@@ -146,17 +158,17 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let rel = in.uv;
     let rxy = p.rect.xy;
     let rwh = p.rect.zw;
-    let inside = select(
-        vec2<bool>(false, false),
-        vec2<bool>(true, true),
-        (rel.x >= rxy.x) & (rel.x < rxy.x + rwh.x) & (rel.y >= rxy.y) & (rel.y < rxy.y + rwh.y)
-    );
-    if (!inside.x || !inside.y || rwh.x <= 0.0 || rwh.y <= 0.0) {
+    // Scalar boolean logic: naga 25 only accepts `select` with a condition
+    // shaped like the operands, so a component-wise select here would need
+    // a vec2<bool> condition — a plain `&` of comparisons is equivalent.
+    let inside = (rel.x >= rxy.x) & (rel.x < rxy.x + rwh.x)
+               & (rel.y >= rxy.y) & (rel.y < rxy.y + rwh.y);
+    if (!inside || rwh.x <= 0.0 || rwh.y <= 0.0) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
     let video_uv = (rel - rxy) / rwh;
 
-    let filter = u32(p.misc.w);
+    let filter_kind = u32(p.misc.w);
     let depth_y = p.misc.x;
     let depth_c = p.misc.y;
     let shift = p.misc.z;
@@ -167,7 +179,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let ratio = p.src.zw / p.src.xy;
     let ctc = (ytc + vec2<f32>(0.5)) * ratio;
 
-    let y = fetch(tex_y, ytc, p.src.xy, depth_y, shift, filter);
+    let y = fetch(tex_y, ytc, p.src.xy, depth_y, shift, filter_kind);
 
     var u: f32;
     var v: f32;
@@ -188,8 +200,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         u = norm(u32(ur), depth_c, shift);
         v = norm(u32(vr), depth_c, shift);
     } else {
-        u = fetch(tex_u, ctc, p.src.zw, depth_c, shift, filter);
-        v = fetch(tex_v, ctc, p.src.zw, depth_c, shift, filter);
+        u = fetch(tex_u, ctc, p.src.zw, depth_c, shift, filter_kind);
+        v = fetch(tex_v, ctc, p.src.zw, depth_c, shift, filter_kind);
     }
 
     var rgb = vec3<f32>(
@@ -199,11 +211,14 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     );
 
     // Ordered dithering before quantization to the output bit depth.
+    // `amp` is documented (and passed by the host) in 8-bit LSBs, but rgb
+    // here is normalized [0,1] — scale the pattern by 1/255 or a "1 LSB"
+    // dither becomes a ±128 LSB checkerboard (the 0.1.1-class bug the
+    // roundtrip test exists to catch).
     let amp = p.mode.y;
     if (amp > 0.0) {
-        let m = bayer(u32(p.mode.z));
         let px = vec2<i32>(in.pos.xy);
-        let d = (m[px.y % 8][px.x % 8] / 64.0 - 0.5) * amp;
+        let d = (bayer_value(u32(p.mode.z), px) / 64.0 - 0.5) * (amp / 255.0);
         rgb = rgb + vec3<f32>(d);
     }
 

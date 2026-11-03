@@ -1,0 +1,415 @@
+name: release
+
+# Cross-compiled release binaries for every wgpu platform.
+#
+#   tag push (v*)   -> builds all targets, then attaches the archives to
+#                      a GitHub Release (plus SHA256SUMS)
+#   manual dispatch -> builds all targets, artifacts on the run page only
+#
+# Every archive carries include/bwgpu.h, LICENSE and README.md, plus the
+# cdylib (except musl, which is static-only by design) and the `player`
+# demo binary (except Android, where winit needs an android-activity
+# entry point instead of a plain executable).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Strip explicitly in the packaging step (with the right per-platform
+  # tool) instead of trusting cargo's cross-target strip behavior.
+  CARGO_PROFILE_RELEASE_STRIP: "false"
+
+jobs:
+  # Shader + lockfile gate. Device-free and fast, but load-bearing: this is
+  # the test that would have blocked the 0.1.1 release (naga 25 rejects
+  # `filter` as an identifier — a parse error every user hit at first
+  # paint). No cross-compilation happens until this passes.
+  validate:
+    timeout-minutes: 15
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-validate-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-validate-
+
+      - name: Exactly one naga in the dependency tree
+        run: cargo tree --locked -i naga
+
+      - name: Parse + validate every WGSL module
+        run: cargo test --locked --test shader_validation
+
+  build:
+    needs: validate
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- Linux ------------------------------------------------
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            apt: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            apt: musl-tools
+            linker: musl-gcc
+          # --- Windows -----------------------------------------------
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+          # --- macOS -------------------------------------------------
+          - target: x86_64-apple-darwin
+            os: macos-latest        # arm64 runner, Apple SDK cross-links
+          - target: aarch64-apple-darwin
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Bump when the packaging logic changes; shows up in the run log so
+      # a stale workflow file (re-run of an old commit, wrong branch) is
+      # immediately obvious.
+      - name: Workflow revision
+        shell: bash
+        run: echo "release.yml revision 5 (shader-validate gate before cross-build)"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Install cross toolchain (Linux)
+        if: matrix.apt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Configure cross linker
+        if: matrix.linker
+        shell: bash
+        run: |
+          VAR="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER"
+          echo "$VAR=${{ matrix.linker }}" >> "$GITHUB_ENV"
+
+      - name: Add rust target
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build (lib + demo player)
+        shell: bash
+        run: cargo build --locked --release --target ${{ matrix.target }} --lib --example player
+
+      - name: Strip link products
+        shell: bash
+        run: |
+          T=${{ matrix.target }}
+          D=target/$T/release
+          P="$D/examples/player"   # examples build to <profile>/examples/
+          case "$RUNNER_OS" in
+            Linux)
+              if [ "$T" = "x86_64-unknown-linux-gnu" ]; then
+                  strip --strip-unneeded "$D/libbwgpu.so" "$P" 2>/dev/null || true
+              elif [ "$T" = "aarch64-unknown-linux-gnu" ]; then
+                  aarch64-linux-gnu-strip --strip-unneeded "$D/libbwgpu.so" "$P" 2>/dev/null || true
+              else
+                  # musl: cdylib is dropped (static-only target); only the
+                  # static player binary exists to strip.
+                  strip --strip-unneeded "$P" 2>/dev/null || true
+              fi
+              ;;
+            macOS)
+              strip -x "$D/libbwgpu.dylib" "$P" 2>/dev/null || true
+              ;;
+            Windows)
+              command -v llvm-strip >/dev/null 2>&1 && \
+                  llvm-strip "$D/bwgpu.dll" "$P.exe" 2>/dev/null || true
+              ;;
+          esac
+
+      - name: Package
+        shell: bash
+        run: |
+          T=${{ matrix.target }}
+          D=target/$T/release
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          NAME="bwgpu-$V-$T"
+
+          # Locate the demo binary (cargo builds examples into
+          # <profile>/examples/; be tolerant of layout surprises and say
+          # exactly what is missing instead of a bare "cp: cannot stat").
+          EXE=player
+          if [ "$RUNNER_OS" = Windows ]; then EXE=player.exe; fi
+          PLAYER=$(find "$D" -maxdepth 2 -type f -name "$EXE" | head -1 || true)
+          if [ -z "$PLAYER" ]; then
+              echo "FAIL - demo binary '$EXE' not found under $D" >&2
+              echo "--- contents of $D: ---" >&2
+              ls -la "$D" >&2 || true
+              ls -la "$D/examples" >&2 || true
+              exit 1
+          fi
+          echo "demo binary: $PLAYER"
+
+          mkdir -p "dist/$NAME/include" "dist/$NAME/lib" "dist/$NAME/bin"
+          cp include/bwgpu.h "dist/$NAME/include/"
+          cp README.md LICENSE "dist/$NAME/"
+          case "$RUNNER_OS" in
+            Linux)
+              cp "$PLAYER" "dist/$NAME/bin/"
+              cp "$D/libbwgpu.a" "dist/$NAME/lib/"
+              if [ -f "$D/libbwgpu.so" ]; then
+                  cp "$D/libbwgpu.so" "dist/$NAME/lib/"
+              else
+                  # musl is static-only: no .so is produced (cargo prints
+                  # "dropping unsupported crate type cdylib"). The fully
+                  # static libbwgpu.a + static player are the artifact.
+                  echo "no cdylib: static-only target" > "dist/$NAME/STATIC.txt"
+              fi
+              tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
+              rm -rf "dist/$NAME"
+              ;;
+            macOS)
+              cp "$PLAYER" "dist/$NAME/bin/"
+              cp "$D/libbwgpu.dylib" "dist/$NAME/lib/"
+              cp "$D/libbwgpu.a" "dist/$NAME/lib/"
+              tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
+              rm -rf "dist/$NAME"
+              ;;
+            Windows)
+              cp "$PLAYER" "dist/$NAME/bin/"
+              cp "$D/bwgpu.dll" "$D/bwgpu.dll.lib" "$D/bwgpu.lib" "dist/$NAME/lib/"
+              (cd dist && 7z a "$NAME.zip" "$NAME")
+              rm -rf "dist/$NAME"
+              ;;
+          esac
+          ls -l dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bwgpu-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  # macOS universal binary: lipo the two single-arch dylibs/static libs.
+  universal:
+    needs: build
+    timeout-minutes: 15
+    runs-on: macos-14
+    steps:
+      - name: Download the two macOS builds
+        uses: actions/download-artifact@v4
+        with:
+          path: dl/
+
+      - name: lipo -> universal2
+        shell: bash
+        run: |
+          set -eu
+          # No checkout in this job: take the version from the archive name
+          # (bwgpu-<ver>-x86_64-apple-darwin.tar.gz).
+          ARCH=$(ls dl/bwgpu-x86_64-apple-darwin/bwgpu-*-x86_64-apple-darwin.tar.gz)
+          BASE=$(basename "$ARCH" .tar.gz)
+          V=${BASE#bwgpu-}; V=${V%-x86_64-apple-darwin}
+          NAME="bwgpu-$V-macos-universal2"
+          mkdir -p merged "$NAME/include" "$NAME/lib" "$NAME/bin"
+          # The packaging step archives the directory "bwgpu-$V-<target>",
+          # so the extracted paths are deterministic. Do NOT glob into a
+          # variable: 'X=dir/*-*' stays literal (no pathname expansion in
+          # assignments) and quoted use then breaks cp - exactly the
+          # 'merged/bwgpu-*-...: No such file or directory' failure.
+          X64="merged/bwgpu-$V-x86_64-apple-darwin"
+          ARM="merged/bwgpu-$V-aarch64-apple-darwin"
+          tar -xzf dl/bwgpu-x86_64-apple-darwin/bwgpu-*-x86_64-apple-darwin.tar.gz -C merged/
+          tar -xzf dl/bwgpu-aarch64-apple-darwin/bwgpu-*-aarch64-apple-darwin.tar.gz -C merged/
+          for D in "$X64" "$ARM"; do
+              if [ ! -d "$D" ]; then
+                  echo "FAIL - expected extracted directory '$D' not found" >&2
+                  echo "--- contents of merged/: ---" >&2
+                  ls -la merged/ >&2 || true
+                  exit 1
+              fi
+          done
+          cp "$X64/include/bwgpu.h" "$NAME/include/"
+          cp "$X64/README.md" "$X64/LICENSE" "$NAME/"
+          lipo -create -output "$NAME/lib/libbwgpu.dylib" \
+              "$X64/lib/libbwgpu.dylib" "$ARM/lib/libbwgpu.dylib"
+          lipo -create -output "$NAME/lib/libbwgpu.a" \
+              "$X64/lib/libbwgpu.a" "$ARM/lib/libbwgpu.a"
+          lipo -create -output "$NAME/bin/player" \
+              "$X64/bin/player" "$ARM/bin/player"
+          tar -czf "$NAME.tar.gz" "$NAME"
+          echo "built $NAME.tar.gz: $(lipo -info "$NAME/lib/libbwgpu.dylib")"
+
+      - name: Upload universal artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bwgpu-macos-universal2
+          path: bwgpu-*-macos-universal2.tar.gz
+          if-no-files-found: error
+
+  # Android: one NDK install (checksum-pinned, cached), three ABIs.
+  # libbwgpu.so is what an APK links/loads; the demo player is skipped
+  # because winit on Android needs an android-activity entry point
+  # instead of a plain binary. wgpu renders through its Vulkan backend.
+  android:
+    timeout-minutes: 45
+    runs-on: ubuntu-22.04
+    env:
+      NDK_URL: https://dl.google.com/android/repository/android-ndk-r30-linux.zip
+      NDK_SHA1: 5107f898313790e449e87eee2183d9a20602dee9
+      ANDROID_API: 24
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-Linux-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-Linux-
+
+      - name: Cache NDK
+        id: ndk
+        uses: actions/cache@v4
+        with:
+          path: ~/ndk
+          key: android-ndk-r30-linux
+
+      - name: Download NDK (checksum-pinned)
+        if: steps.ndk.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o /tmp/ndk.zip "$NDK_URL"
+          echo "$NDK_SHA1  /tmp/ndk.zip" | sha1sum -c -
+          mkdir -p /tmp/ndk-unpack
+          unzip -q /tmp/ndk.zip -d /tmp/ndk-unpack
+          mv /tmp/ndk-unpack/android-ndk-* ~/ndk
+          rm -rf /tmp/ndk-unpack /tmp/ndk.zip
+
+      - name: Add Android rust targets
+        # armv7-linux-androideabi is deliberately absent: NDK r27+ ships no
+        # arm libunwind, so rustc's `-lunwind` cannot resolve (verified
+        # against NDK r30: "ld.lld: error: unable to find library -lunwind"),
+        # and wgpu renders through Vulkan anyway — a capability that arrived
+        # with the arm64 device generation. arm64-v8a + x86_64 cover it.
+        run: rustup target add aarch64-linux-android x86_64-linux-android
+
+      - name: Build + package (arm64-v8a + x86_64)
+        shell: bash
+        run: |
+          set -eu
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          TC="$HOME/ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          if [ ! -x "$TC/llvm-strip" ]; then
+              echo "FAIL - NDK toolchain not found at $TC" >&2
+              ls -la ~/ndk 2>/dev/null || true
+              exit 1
+          fi
+          for T in aarch64-linux-android x86_64-linux-android; do
+              case "$T" in
+                  aarch64-linux-android)   TRIPLE=aarch64-linux-android ;;
+                  x86_64-linux-android)    TRIPLE=x86_64-linux-android ;;
+              esac
+              # cargo env names use underscores: CARGO_TARGET_<TRIPLE>_LINKER
+              ENV_T=$(echo "$T" | tr 'a-z-' 'A-Z_')
+              export "CARGO_TARGET_${ENV_T}_LINKER=$TC/${TRIPLE}${ANDROID_API}-clang"
+              echo "== $T (linker: $TC/${TRIPLE}${ANDROID_API}-clang) =="
+              cargo build --locked --release --target "$T" --lib
+              "$TC/llvm-strip" --strip-unneeded "target/$T/release/libbwgpu.so"
+              NAME="bwgpu-$V-$T"
+              mkdir -p "dist/$NAME/include" "dist/$NAME/lib"
+              cp include/bwgpu.h "dist/$NAME/include/"
+              cp README.md LICENSE "dist/$NAME/"
+              cp "target/$T/release/libbwgpu.so" "target/$T/release/libbwgpu.a" "dist/$NAME/lib/"
+              {
+                  echo "bwgpu for Android ($T)"
+                  echo
+                  echo "minSdk/API: $ANDROID_API (Android 7.0+)."
+                  echo "wgpu renders through its Vulkan backend: a Vulkan-capable"
+                  echo "device is required. There is no demo binary here - winit on"
+                  echo "Android needs an android-activity entry point, not a plain"
+                  echo "executable."
+                  echo
+                  echo "lib/libbwgpu.so : the cdylib an APK loads (System.loadLibrary)"
+                  echo "                  or links directly from the mpv Android build."
+                  echo "lib/libbwgpu.a  : static lib for linking into a custom build."
+                  echo "include/bwgpu.h : the stable C ABI (see README for the surface)."
+              } > "dist/$NAME/ANDROID.txt"
+              tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
+              rm -rf "dist/$NAME"
+          done
+          ls -l dist/
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bwgpu-android
+          path: dist/
+          if-no-files-found: error
+
+  # Attach everything to a GitHub Release (tag pushes only).
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, universal, android]
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum bwgpu-*.tar.gz bwgpu-*.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # No checkout in this job: derive the version from the tag.
+          V=${GITHUB_REF_NAME#v}
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+              --title "bwgpu $V" \
+              --notes "Cross-compiled binaries for all wgpu platforms.
+
+          - Linux gnu archives: libbwgpu.so + libbwgpu.a + demo player
+            (x86_64 built on ubuntu-22.04 for broad glibc compatibility;
+            aarch64 cross-compiled).
+          - Linux musl archive: fully static libbwgpu.a + static player
+            (musl is a static-only target; there is no .so by design).
+          - Windows archives: bwgpu.dll + import library (bwgpu.dll.lib)
+            + static lib (bwgpu.lib) + player.exe.
+          - macOS: per-arch archives plus a universal2 (lipo) archive.
+          - Android: libbwgpu.so + libbwgpu.a for arm64-v8a and the
+            x86_64 emulator (API 24+, Vulkan-capable device; no demo
+            binary by design — winit needs an android-activity entry).
+
+          Each archive carries include/bwgpu.h, LICENSE and README.md." \
+              --generate-notes

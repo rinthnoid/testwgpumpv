@@ -1,6 +1,6 @@
 [package]
 name = "bwgpu"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 # Verified with `cargo +1.86 check --locked --all-targets` against
 # Cargo.lock; the CI keeps this honest with an msrv job.
@@ -35,6 +35,11 @@ pollster = "0.4"
 [dev-dependencies]
 winit = "0.30"
 env_logger = "0.11"
+# Shader-gate dependency (tests/shader_validation.rs). Must stay in the
+# same major line as the naga that `wgpu` bundles: cargo unifies both to
+# the single version recorded in Cargo.lock, and ci.yml asserts exactly
+# one naga exists in the tree (`cargo tree -i naga`).
+naga = "25"
 
 [profile.release]
 lto = "thin"

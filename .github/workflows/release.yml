@@ -26,7 +26,33 @@ env:
   CARGO_PROFILE_RELEASE_STRIP: "false"
 
 jobs:
+  # Shader + lockfile gate. Device-free and fast, but load-bearing: this is
+  # the test that would have blocked the 0.1.1 release (naga 25 rejects
+  # `filter` as an identifier — a parse error every user hit at first
+  # paint). No cross-compilation happens until this passes.
+  validate:
+    timeout-minutes: 15
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-validate-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-validate-
+
+      - name: Exactly one naga in the dependency tree
+        run: cargo tree --locked -i naga
+
+      - name: Parse + validate every WGSL module
+        run: cargo test --locked --test shader_validation
+
   build:
+    needs: validate
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -62,7 +88,7 @@ jobs:
       # immediately obvious.
       - name: Workflow revision
         shell: bash
-        run: echo "release.yml revision 4 (android verified against NDK r30, ABI set fixed)"
+        run: echo "release.yml revision 5 (shader-validate gate before cross-build)"
 
       - name: Cache cargo registry
         uses: actions/cache@v4

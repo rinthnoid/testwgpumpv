@@ -39,8 +39,10 @@ scripts/
   strip_mpv.sh/.py       removes the legacy stack from an mpv tree
   mpv_stub/              stub mpv headers for the syntax check
 tests/
+  shader_validation.rs   parse+validate every WGSL with wgpu's own naga (no GPU, never skips)
   uniform_layout.rs      Rust/WGSL/C-header layout drift guards (no GPU)
-  render_roundtrip.rs    GPU output vs f64 CPU reference (skips w/o GPU)
+  render_roundtrip.rs    GPU output vs f64 CPU reference, planar + NV12
+                         (fails instead of skipping when BWGPU_REQUIRE_GPU=1)
 ```
 
 ## Quick start
@@ -48,7 +50,9 @@ tests/
 ```sh
 cargo build --release
 sh scripts/c_smoke.sh          # builds, links C against the ABI, verifies pixels
-cargo test                     # layout guards always run; GPU tests auto-skip
+cargo test                     # shader gate + layout guards always run;
+                               # GPU tests run wherever an adapter exists and
+                               # MUST run when BWGPU_REQUIRE_GPU=1 (Linux CI)
 sh scripts/check_vo_wgpu.sh    # syntax-check mpv-glue/vo_wgpu.c (x11/wl/win32)
 ```
 
@@ -64,10 +68,13 @@ Strip the legacy stack out of an mpv checkout:
 
 ## Prebuilt binaries (GitHub Actions)
 
-CI builds and tests every push on Windows, Linux and macOS; the
-`release` workflow cross-compiles the C library for all targets below
-on a tag push (`git tag v0.1.1 && git push --tags`) and attaches the
-archives — plus `SHA256SUMS` — to a GitHub Release:
+CI builds and tests every push on Windows, Linux and macOS (Linux CI runs
+the full GPU roundtrip on lavapipe — a missing adapter fails the build);
+the `release` workflow first parses + validates every WGSL module with the
+exact naga version wgpu bundles, and only then cross-compiles the C
+library for all targets below on a tag push
+(`git tag v0.1.2 && git push --tags`) and attaches the archives — plus
+`SHA256SUMS` — to a GitHub Release:
 
 | Archive | Contents |
 | --- | --- |
@@ -79,8 +86,6 @@ archives — plus `SHA256SUMS` — to a GitHub Release:
 | `bwgpu-<v>-x86_64-apple-darwin.tar.gz` | `libbwgpu.dylib`, `libbwgpu.a`, `player` (Intel) |
 | `bwgpu-<v>-aarch64-apple-darwin.tar.gz` | same (Apple Silicon) |
 | `bwgpu-<v>-macos-universal2.tar.gz` | both macOS architectures `lipo`-merged |
-| `bwgpu-<v>-aarch64-linux-android.tar.gz` | `libbwgpu.so` + `libbwgpu.a` + `ANDROID.txt` (arm64-v8a, API 24+, Vulkan-capable device; no demo binary) |
-| `bwgpu-<v>-x86_64-linux-android.tar.gz` | same (x86_64 emulator). armeabi-v7a is deliberately not built — modern NDKs ship no arm libunwind for rustc, and wgpu needs Vulkan (an arm64-era feature) |
 
 Every archive carries `include/bwgpu.h`, `LICENSE` and `README.md`.
 To publish a release: push the repo to GitHub, then tag — no other
