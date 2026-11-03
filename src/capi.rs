@@ -168,6 +168,12 @@ pub unsafe extern "C" fn bwgpu_renderer_free(r: *mut Renderer) {
 pub unsafe extern "C" fn bwgpu_renderer_resize(r: *mut Renderer, w: u32, h: u32) -> c_int {
     guard(ERR, || match renderer_from_ptr(r) {
         None => null_renderer_error(),
+        // A zero-size target is a host bug, not something to silently
+        // clamp: reject it so mpv-side geometry mistakes are visible.
+        Some(_) if w == 0 || h == 0 => {
+            set_error("resize: zero width or height");
+            ERR
+        }
         Some(rend) => match rend.resize(w, h) {
             Ok(()) => OK,
             Err(e) => {

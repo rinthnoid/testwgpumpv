@@ -81,8 +81,7 @@ pub struct Renderer {
 impl Renderer {
     /// Headless renderer (offscreen rendering + readback only).
     pub fn new(width: u32, height: u32) -> Result<Self> {
-        let instance = Self::instance();
-        Self::create(&instance, None, width.max(1), height.max(1), true)
+        Self::create(None, width.max(1), height.max(1), true)
     }
 
     /// Renderer targeting a native window.
@@ -97,29 +96,21 @@ impl Renderer {
                 .create_surface_unsafe(target)
                 .map_err(|e| Error::Init(format!("create_surface: {e}")))?
         };
-        Self::create(&instance, Some(surface), width.max(1), height.max(1), vsync)
+        Self::create(Some(surface), width.max(1), height.max(1), vsync)
     }
 
     fn instance() -> wgpu::Instance {
         wgpu::Instance::new(&wgpu::InstanceDescriptor::default())
     }
 
-    /// Shared construction path. `surface` MUST have been created from the
-    /// same `wgpu::Instance` that is passed in: wgpu tracks every surface in
-    /// its creating instance's resource hub, and `request_adapter` with a
-    /// foreign `compatible_surface` looks the id up in the wrong hub and
-    /// panics ("Surface[..] does not exist", wgpu-core `storage.rs::get`).
-    /// The surface, adapter and device below therefore always share exactly
-    /// one instance. Letting the local `instance` handle drop afterwards is
-    /// fine — every wgpu resource holds its own `Arc` to the shared context.
     fn create(
-        instance: &wgpu::Instance,
         surface: Option<wgpu::Surface<'static>>,
         width: u32,
         height: u32,
         vsync: bool,
     ) -> Result<Self> {
-        let gpu = Gpu::new(instance, surface.as_ref())?;
+        let instance = Self::instance();
+        let gpu = Gpu::new(&instance, surface.as_ref())?;
 
         let surface_config = surface.as_ref().map(|s| {
             let caps = s.get_capabilities(&gpu.adapter);
@@ -152,9 +143,9 @@ impl Renderer {
         // Pre-build pipelines for the known target formats so first-frame
         // hitches don't include shader compilation.
         if let Some(cfg) = &renderer.surface_config {
-            renderer.ensure_pipes(cfg.format)?;
+            renderer.ensure_pipes(cfg.format);
         }
-        renderer.ensure_pipes(wgpu::TextureFormat::Rgba8Unorm)?;
+        renderer.ensure_pipes(wgpu::TextureFormat::Rgba8Unorm);
         // Push the initial uniform block (safe idle defaults: bilinear,
         // 8-bit, full-surface rect) so every draw is well-defined.
         renderer.apply_rect();
@@ -163,15 +154,15 @@ impl Renderer {
 
     /// Build (and cache) the pipeline pair for a target format. Pipelines
     /// are `Arc`-backed, so the clone handed to the draw path is cheap.
-    fn ensure_pipes(&mut self, format: wgpu::TextureFormat) -> Result<Pipes> {
+    fn ensure_pipes(&mut self, format: wgpu::TextureFormat) -> Pipes {
         if !self.pipes.contains_key(&format) {
             let video_shader = self.gpu.module(
                 include_str!("../shaders/video_blit.wgsl"),
                 "bwgpu-video-blit",
-            )?;
+            );
             let osd_shader = self
                 .gpu
-                .module(include_str!("../shaders/osd_blend.wgsl"), "bwgpu-osd")?;
+                .module(include_str!("../shaders/osd_blend.wgsl"), "bwgpu-osd");
 
             let vpl = self
                 .gpu
@@ -267,7 +258,7 @@ impl Renderer {
 
             self.pipes.insert(format, Pipes { video, osd });
         }
-        Ok(self.pipes.get(&format).unwrap().clone())
+        self.pipes.get(&format).unwrap().clone()
     }
 
     pub fn adapter_name(&self) -> &str {
@@ -516,7 +507,7 @@ impl Renderer {
     /// The one draw: video blit, then OSD quads. Same path for surface and
     /// offscreen targets.
     fn draw(&mut self, view: &TextureView, format: wgpu::TextureFormat) -> Result<()> {
-        let pipes = self.ensure_pipes(format)?;
+        let pipes = self.ensure_pipes(format);
         // Bind groups are rebuilt per frame; OSD item counts are tiny.
         let osd_binds: Vec<BindGroup> = self
             .osd

@@ -75,13 +75,21 @@ fn reference_rgb(
     for j in 0..h {
         for i in 0..w {
             let yv = fetch(y, w, h, i as f64 + 0.5, j as f64 + 0.5);
-            // Co-sited chroma: c = (y_texel + 0.5) * 0.5 - 0.5
-            let ctc_x = (i as f64 + 0.5) * (cw as f64 / w as f64);
-            let ctc_y = (j as f64 + 0.5) * (ch as f64 / h as f64);
+            // Co-sited chroma, matching the shader exactly: ctc =
+            // (ytc + 0.5) * ratio, and fetch() subtracts the half-texel
+            // itself. For even i this lands dead on chroma texel i/2.
+            let ctc_x = (i as f64 + 1.0) * (cw as f64 / w as f64);
+            let ctc_y = (j as f64 + 1.0) * (ch as f64 / h as f64);
             let uv = fetch(u, cw, ch, ctc_x, ctc_y);
             let vv = fetch(v, cw, ch, ctc_x, ctc_y);
             let rgb = params.convert_point(yv as f32, uv as f32, vv as f32);
-            out.push([rgb[0] as f64, rgb[1] as f64, rgb[2] as f64]);
+            // The fragment shader clamps out-of-gamut RGB into [0,1]
+            // before quantizing; the ramp frame (luma and chroma ramps
+            // varying independently) hits out-of-gamut corners, so the
+            // reference must apply the same clamp or every corner pixel
+            // shows a fake divergence.
+            let cl = |v: f32| v.clamp(0.0, 1.0);
+            out.push([cl(rgb[0]) as f64, cl(rgb[1]) as f64, cl(rgb[2]) as f64]);
         }
     }
     out
@@ -92,12 +100,32 @@ fn adapter_available() -> bool {
     Renderer::new(4, 4).is_ok()
 }
 
+/// Refuse to silently skip on CI: with BWGPU_REQUIRE_GPU=1 (set on Linux
+/// CI, where lavapipe makes an adapter deterministic) a missing adapter is
+/// a hard failure, not a skip. This is the guard that was missing when a
+/// broken shader reached the 0.1.1 release unnoticed.
+fn adapter_required() -> Result<(), String> {
+    if adapter_available() {
+        return Ok(());
+    }
+    if std::env::var("BWGPU_REQUIRE_GPU").as_deref() == Ok("1") {
+        return Err("no wgpu adapter available and BWGPU_REQUIRE_GPU=1 — this \
+             environment MUST provide one (e.g. install mesa-vulkan-drivers \
+             for lavapipe)"
+            .to_string());
+    }
+    Err("skipping: no wgpu adapter in this environment".to_string())
+}
+
 #[test]
 fn gpu_matches_cpu_reference() {
     let _ = env_logger::try_init();
-    if !adapter_available() {
-        eprintln!("skipping: no wgpu adapter in this environment (CI has one)");
-        return;
+    if let Err(why) = adapter_required() {
+        if why.starts_with("skipping") {
+            eprintln!("{why}");
+            return;
+        }
+        panic!("{why}");
     }
 
     let (w, h) = (64u32, 64u32);
@@ -139,9 +167,12 @@ fn gpu_matches_cpu_reference() {
 #[test]
 fn osd_blends_over_video() {
     let _ = env_logger::try_init();
-    if !adapter_available() {
-        eprintln!("skipping: no wgpu adapter in this environment (CI has one)");
-        return;
+    if let Err(why) = adapter_required() {
+        if why.starts_with("skipping") {
+            eprintln!("{why}");
+            return;
+        }
+        panic!("{why}");
     }
 
     let (w, h) = (16u32, 16u32);
@@ -197,5 +228,105 @@ fn osd_blends_over_video() {
     assert!(
         right[0] < left[0] - 100,
         "right {right:?} should be much darker in R than left {left:?}"
+    );
+}
+
+/// Interleaved-chroma path (NV12): U and V live in one RG texture, read as
+/// .r/.g by the shader's interleaved branch. Same deal as the planar test:
+/// GPU output must match the CPU reference bit-for-bit-ish.
+#[test]
+fn nv12_matches_cpu_reference() {
+    let _ = env_logger::try_init();
+    if let Err(why) = adapter_required() {
+        if why.starts_with("skipping") {
+            eprintln!("{why}");
+            return;
+        }
+        panic!("{why}");
+    }
+
+    let (w, h) = (32u32, 32u32);
+    let cw = w / 2;
+    let ch = h / 2;
+    let mut y = vec![0u8; (w * h) as usize];
+    let mut uv = vec![0u8; (cw * ch * 2) as usize];
+    for j in 0..h {
+        for i in 0..w {
+            y[(j * w + i) as usize] = ((i * 7 + j * 3) & 0xff) as u8;
+        }
+    }
+    for j in 0..ch {
+        for i in 0..cw {
+            uv[((j * cw + i) * 2) as usize] = (60 + i * 4) as u8; // U
+            uv[((j * cw + i) * 2 + 1) as usize] = (200 - j * 4) as u8; // V
+        }
+    }
+    let (ys, uvs) = (y.clone(), uv.clone());
+    let frame = VideoFrame {
+        fmt: PixFmt::Nv12,
+        width: w,
+        height: h,
+        planes: [
+            Plane {
+                data: Box::leak(ys.into_boxed_slice()),
+                stride: 0,
+            },
+            Plane {
+                data: Box::leak(uvs.into_boxed_slice()),
+                stride: 0,
+            },
+            Plane::empty(),
+        ],
+    };
+
+    let mut r = Renderer::new(w, h).expect("headless renderer");
+    r.set_colorspace(YuvMatrix::Bt601, YuvRange::Limited);
+    r.set_video(&frame).expect("upload");
+    r.render_frame().expect("render");
+
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    r.render_offscreen(&mut out, 0).expect("readback");
+
+    // CPU reference: bilinear over the Y plane; bilinear over the RG plane
+    // with .r -> U, .g -> V; BT.601 limited matrix.
+    let mut params = bwgpu::params::Params::new(w, h);
+    params.set_colorspace(YuvMatrix::Bt601, YuvRange::Limited);
+    let fetch =
+        |plane: &[u8], comps: usize, pw: u32, ph: u32, x: f64, yy: f64, comp: usize| -> f64 {
+            let bx = x - 0.5;
+            let by = yy - 0.5;
+            let fx = bx.fract();
+            let fy = by.fract();
+            let cl = |v: f64, n: f64| v.clamp(0.0, n - 1.0);
+            let i0 = cl(bx.floor(), pw as f64) as usize;
+            let j0 = cl(by.floor(), ph as f64) as usize;
+            let i1 = cl(bx.floor() + 1.0, pw as f64) as usize;
+            let j1 = cl(by.floor() + 1.0, ph as f64) as usize;
+            let s = |a: usize, b: usize| plane[(b * pw as usize + a) * comps + comp] as f64 / 255.0;
+            let p = s(i0, j0) * (1.0 - fx) + s(i1, j0) * fx;
+            let q = s(i0, j1) * (1.0 - fx) + s(i1, j1) * fx;
+            p * (1.0 - fy) + q * fy
+        };
+    let mut max_diff = 0u32;
+    for j in 0..h {
+        for i in 0..w {
+            let yv = fetch(&y, 1, w, h, i as f64 + 0.5, j as f64 + 0.5, 0);
+            let ctc_x = (i as f64 + 1.0) * (cw as f64 / w as f64);
+            let ctc_y = (j as f64 + 1.0) * (ch as f64 / h as f64);
+            let uvv = fetch(&uv, 2, cw, ch, ctc_x, ctc_y, 0);
+            let vvv = fetch(&uv, 2, cw, ch, ctc_x, ctc_y, 1);
+            let rgb = params.convert_point(yv as f32, uvv as f32, vvv as f32);
+            let o = ((j * w + i) * 4) as usize;
+            for c in 0..3 {
+                let exp = (rgb[c].clamp(0.0, 1.0) * 255.0).round() as i64;
+                let diff = (out[o + c] as i64 - exp).abs();
+                max_diff = max_diff.max(diff as u32);
+            }
+            assert_eq!(out[o + 3], 255, "alpha must be opaque");
+        }
+    }
+    assert!(
+        max_diff <= 2,
+        "NV12 GPU output diverges from CPU reference by {max_diff} LSB"
     );
 }

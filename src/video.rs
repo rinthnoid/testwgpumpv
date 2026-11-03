@@ -132,7 +132,12 @@ impl<'a> VideoFrame<'a> {
         }
         let (cw, ch) = self.chroma_size();
         let need = [(self.width, self.height), (cw, ch), (cw, ch)];
-        let bpp: [usize; 4] = [1, 2, 2, 4]; // bytes per chroma/luma sample per fmt
+        // Bytes per sample: luma is 1 byte for 8-bit formats and 2 for
+        // 10-bit; chroma additionally widens for interleaved (RG) storage.
+        // A single per-format number here rejected tight-packed NV12 luma
+        // (stride = width, not width * 2) at upload time.
+        let luma_bpp: [usize; 4] = [1, 1, 2, 2];
+        let chroma_bpp: [usize; 4] = [1, 2, 2, 4];
         let idx = match self.fmt {
             PixFmt::I420 => 0,
             PixFmt::Nv12 => 1,
@@ -147,7 +152,12 @@ impl<'a> VideoFrame<'a> {
                 continue;
             }
             let (w, h) = need[i];
-            let min_stride = w as usize * bpp[idx];
+            let bpp = if i == 0 {
+                luma_bpp[idx]
+            } else {
+                chroma_bpp[idx]
+            };
+            let min_stride = w as usize * bpp;
             let stride = if plane.stride == 0 {
                 min_stride
             } else {
@@ -173,8 +183,9 @@ pub struct VideoPass {
     pub params_buf: Buffer,
     pub params: Params,
     /// Pooled textures keyed by (slot, fmt, w, h) to avoid per-frame
-    /// reallocation. Slots: 0 = luma, 1 = chroma.
-    pool: Vec<(usize, PixFmt, u32, u32, Texture)>,
+    /// reallocation. Slots: 0 = luma, 1 = chroma, 2 = V plane (planar
+    /// formats only — interleaved formats reuse slot 1 for both bindings).
+    pub(crate) pool: Vec<(usize, PixFmt, u32, u32, Texture)>,
     pub views: [Option<TextureView>; 2],
     pub bind: Option<BindGroup>,
 }
@@ -248,7 +259,9 @@ impl VideoPass {
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bwgpu-video-params"),
             size: crate::params::PARAMS_SIZE as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let bind = Self::dummy_bind(device, &bgl, &params_buf);
@@ -277,7 +290,12 @@ impl VideoPass {
         {
             return self.pool.swap_remove(pos).4;
         }
-        let (tf, _) = fmt.tex_formats();
+        // Slot 0 is the luma plane; slots 1/2 are chroma and must use the
+        // CHROMA format (RG for interleaved NV12/P010). Creating chroma
+        // textures with the luma format silently dropped the V channel —
+        // every NV12/P010 frame rendered with V = 0.
+        let (tf_l, tf_c) = fmt.tex_formats();
+        let tf = if slot == 0 { tf_l } else { tf_c };
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&format!("bwgpu-video-slot{slot}")),
             size: wgpu::Extent3d {
@@ -289,7 +307,9 @@ impl VideoPass {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: tf,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         })
     }
@@ -311,7 +331,7 @@ impl VideoPass {
         let (cw, ch) = frame.chroma_size();
 
         let tex_y = self.texture(dev, 0, frame.fmt, frame.width, frame.height);
-        let tex_c = self.texture(dev, 1, frame.fmt, cw, ch);
+        let tex_u = self.texture(dev, 1, frame.fmt, cw, ch);
 
         // Luma
         upload_plane(
@@ -323,10 +343,10 @@ impl VideoPass {
             frame.planes[0].data,
             frame.planes[0].stride,
         );
-        // Chroma
+        // Chroma (U, or the RG plane for interleaved formats)
         upload_plane(
             q,
-            &tex_c,
+            &tex_u,
             tf_c,
             cw,
             ch,
@@ -334,15 +354,35 @@ impl VideoPass {
             frame.planes[1].stride,
         );
 
-        let view_y = tex_y.create_view(&wgpu::TextureViewDescriptor::default());
-        let view_c = tex_c.create_view(&wgpu::TextureViewDescriptor::default());
-        // Recycle last frame's textures into the pool.
-        for old in self.views.iter_mut().take(2) {
-            // Views don't keep textures alive; textures are pooled below.
-            *old = None;
-        }
+        // Planar formats carry a real V plane that must land in its own
+        // texture; binding the U view to the V slot (the pre-0.1.2
+        // behavior) silently converted every planar frame with V = U.
+        let interleaved = frame.fmt.interleaved() > 0.0;
+        let (tex_v, view_v) = if interleaved {
+            // The shader's interleaved branch reads U/V from tex_u .r/.g;
+            // the V binding is never fetched, so alias it to the chroma
+            // view (bindings must still be valid).
+            let v = tex_u.create_view(&wgpu::TextureViewDescriptor::default());
+            (None, v)
+        } else {
+            let tex = self.texture(dev, 2, frame.fmt, cw, ch);
+            upload_plane(
+                q,
+                &tex,
+                tf_c,
+                cw,
+                ch,
+                frame.planes[2].data,
+                frame.planes[2].stride,
+            );
+            let v = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            (Some(tex), v)
+        };
 
-        self.views = [Some(view_y), Some(view_c.clone())];
+        let view_y = tex_y.create_view(&wgpu::TextureViewDescriptor::default());
+        let view_u = tex_u.create_view(&wgpu::TextureViewDescriptor::default());
+        // Drop last frame's views; the textures themselves are pooled.
+        self.views = [Some(view_y), Some(view_u.clone())];
 
         // Uniforms
         self.params.src = [
@@ -356,8 +396,9 @@ impl VideoPass {
         self.params.mode = [frame.fmt.interleaved(), dither, parity as f32, 0.0];
         q.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
 
-        // Bind group: same chroma view goes to both u and v slots for
-        // interleaved formats (the shader reads .r/.g from slot u only).
+        // Bind group: for interleaved formats the same chroma view goes to
+        // both u and v slots (the shader reads .r/.g from the u slot only);
+        // planar formats bind their own V texture.
         self.bind = Some(dev.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bwgpu-video-bind"),
             layout: &self.bgl,
@@ -372,11 +413,11 @@ impl VideoPass {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&view_c),
+                    resource: wgpu::BindingResource::TextureView(&view_u),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&view_c),
+                    resource: wgpu::BindingResource::TextureView(&view_v),
                 },
             ],
         }));
@@ -384,8 +425,11 @@ impl VideoPass {
         // Pool: hold this frame's textures for reuse next frame.
         self.pool
             .push((0, frame.fmt, frame.width, frame.height, tex_y));
-        self.pool.push((1, frame.fmt, cw, ch, tex_c));
-        if self.pool.len() > 8 {
+        self.pool.push((1, frame.fmt, cw, ch, tex_u));
+        if let Some(tex_v) = tex_v {
+            self.pool.push((2, frame.fmt, cw, ch, tex_v));
+        }
+        while self.pool.len() > 12 {
             self.pool.remove(0);
         }
         Ok(())

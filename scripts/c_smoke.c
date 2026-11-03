@@ -186,12 +186,14 @@ int main(int argc, char **argv)
     printf("     luma spread: %ld\n", spread);
 
     /* Red OSD with alpha ramp sits at (8,8)..(24,24). Its right edge
-     * (alpha ~255) must show R dominating B; far from it, R must not
-     * dominate B on the blue-ish gradient top rows (v=200 => B high). */
+     * (alpha ~255) must show R dominating B. Far from the OSD, the video
+     * top rows carry v=200 (Cr drives RED in BT.709), so R must dominate
+     * B there too — this also proves the video is NOT vertically
+     * mirrored: v=200 lives at the TOP of the source frame. */
     int osd_ok = px(out, 20, 20, 0) > px(out, 20, 20, 2) + 40;
-    int far_ok = px(out, OUT_W - 2, 2, 2) > px(out, OUT_W - 2, 2, 0);
+    int far_ok = px(out, OUT_W - 2, 2, 0) > px(out, OUT_W - 2, 2, 2) + 40;
     check(osd_ok, "OSD red wins in OSD region (R > B+40 at 20,20)");
-    check(far_ok, "video blue wins away from OSD (B > R at 126,2)");
+    check(far_ok, "video red wins at top rows (R > B+40 at 126,2)");
 
     /* --- error paths ------------------------------------------------ */
     check(bwgpu_set_video(r, NULL) < 0 && bwgpu_last_error() != NULL,
