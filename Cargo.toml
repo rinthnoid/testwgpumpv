@@ -39,7 +39,7 @@ env_logger = "0.11"
 # same major line as the naga that `wgpu` bundles: cargo unifies both to
 # the single version recorded in Cargo.lock, and ci.yml asserts exactly
 # one naga exists in the tree (`cargo tree -i naga`).
-naga = "25"
+naga = "30"
 
 [profile.release]
 lto = "thin"
