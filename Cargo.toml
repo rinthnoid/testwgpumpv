@@ -26,7 +26,7 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 # media codecs, no placebo. wgpu picks the native backend per platform
 # (DX12 / Vulkan / Metal) and everything else rides on top of it.
 [dependencies]
-wgpu = "25"
+wgpu = "30"
 raw-window-handle = "0.6"
 bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"
